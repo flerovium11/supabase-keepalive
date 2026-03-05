@@ -48,10 +48,10 @@ jobs:
 
               if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 500 ]; then
                 echo "OK: $NAME → HTTP $HTTP"
-                echo "| ✅ $NAME | \`$REF\` | $HTTP |" >> $GITHUB_STEP_SUMMARY
+                echo "| ✅ | $NAME | \`$REF\` | $HTTP |" >> $GITHUB_STEP_SUMMARY
               else
                 echo "::error::FAIL: $NAME ($REF) → HTTP $HTTP"
-                echo "| ❌ $NAME | \`$REF\` | $HTTP |" >> $GITHUB_STEP_SUMMARY
+                echo "| ❌ | $NAME | \`$REF\` | $HTTP |" >> $GITHUB_STEP_SUMMARY
                 FAILED=1
               fi
             done
