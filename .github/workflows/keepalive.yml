@@ -15,6 +15,11 @@ jobs:
         run: |
           FAILED=0
 
+          echo "# Keep-Alive Run" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | Project | Ref | HTTP |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|---------|-----|------|" >> $GITHUB_STEP_SUMMARY
+
           echo "$SUPABASE_TOKENS" | jq -r '.[]' | while read -r TOKEN; do
             PROJECTS=$(curl -sf \
               -H "Authorization: Bearer $TOKEN" \
@@ -43,11 +48,16 @@ jobs:
 
               if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 500 ]; then
                 echo "OK: $NAME → HTTP $HTTP"
+                echo "| ✅ $NAME | \`$REF\` | $HTTP |" >> $GITHUB_STEP_SUMMARY
               else
                 echo "::error::FAIL: $NAME ($REF) → HTTP $HTTP"
+                echo "| ❌ $NAME | \`$REF\` | $HTTP |" >> $GITHUB_STEP_SUMMARY
                 FAILED=1
               fi
             done
           done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_Paused projects skipped. Ran at $(date -u '+%Y-%m-%d %H:%M UTC')._" >> $GITHUB_STEP_SUMMARY
 
           exit $FAILED
