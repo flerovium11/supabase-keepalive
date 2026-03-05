@@ -1,0 +1,52 @@
+name: Supabase Keep-Alive
+
+on:
+  schedule:
+    - cron: "0 8 */3 * *" # Every 3 days at 8:00 UTC
+  workflow_dispatch: # Allow manual runs
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping all projects for all accounts
+        env:
+          # A JSON array of tokens, one per account:
+          # ["token_account_1", "token_account_2", ...]
+          SUPABASE_TOKENS: ${{ secrets.SUPABASE_TOKENS }}
+        run: |
+          FAILED=0
+
+          echo "$SUPABASE_TOKENS" | jq -r '.[]' | while read -r TOKEN; do
+            echo "--- Fetching projects for account ---"
+            PROJECTS=$(curl -sf \
+              -H "Authorization: Bearer $TOKEN" \
+              https://api.supabase.com/v1/projects)
+
+            if [ -z "$PROJECTS" ] || [ "$PROJECTS" = "null" ]; then
+              echo "ERROR: Could not fetch projects (bad token or API error)"
+              FAILED=1
+              continue
+            fi
+
+            echo "$PROJECTS" | jq -c '.[]' | while read -r project; do
+              REF=$(echo "$project" | jq -r '.id')
+              NAME=$(echo "$project" | jq -r '.name')
+              URL="https://${REF}.supabase.co/rest/v1/"
+
+              echo "Pinging $NAME ($REF)..."
+              STATUS=$(curl -o /dev/null -sw "%{http_code}" \
+                -H "apikey: $TOKEN" \
+                "$URL")
+
+              if [ "$STATUS" -lt 200 ] || [ "$STATUS" -ge 500 ]; then
+                echo "FAIL: $NAME returned HTTP $STATUS"
+                FAILED=1
+              else
+                echo "OK: $NAME returned HTTP $STATUS"
+              fi
+            done
+          done
+
+          exit $FAILED
