@@ -234,11 +234,34 @@ jobs:
               fi
             done
 
+            # ── Step 5: Fill remaining quota with unimportant projects ──────
+            echo ""
+            echo "── Step 5: Restore unimportant projects to fill remaining quota ──"
+            BONUS_RESTORED=()
+            for i in "${!UNIMPORTANT_REFS[@]}"; do
+              REF="${UNIMPORTANT_REFS[$i]}"
+              NAME="${UNIMPORTANT_NAMES[$i]}"
+              RESULT=0
+              restore_project "$TOKEN" "$REF" "$NAME" || RESULT=$?
+              if [ "$RESULT" = "0" ]; then
+                BONUS_RESTORED+=("$NAME")
+              elif [ "$RESULT" = "2" ]; then
+                echo "  → Unrecoverable, continuing"
+              else
+                echo "  → Quota full, stopping"
+                break
+              fi
+            done
+
             # ── Summary ───────────────────────────────────────────────────────
             echo ""
             echo "── Account $ACCOUNT_NUM summary ──"
             echo "  ✅ Timers reset for ${#RESTORED_UNIMPORTANT[@]}/${#UNIMPORTANT_REFS[@]} unimportant projects"
             echo "  ✅ Important projects restored: $((${#IMPORTANT_REFS[@]} - ${#FAILED_IMPORTANT[@]} - ${#DEAD_IMPORTANT[@]}))/${#IMPORTANT_REFS[@]}"
+            echo "  ✅ Bonus unimportant projects left active: ${#BONUS_RESTORED[@]}"
+            if [ ${#BONUS_RESTORED[@]} -gt 0 ]; then
+              echo "     (${BONUS_RESTORED[*]})"
+            fi
             if [ ${#FAILED_IMPORTANT[@]} -gt 0 ]; then
               echo "  ⚠️  Could not restore (limit): ${FAILED_IMPORTANT[*]}"
             fi
