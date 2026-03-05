@@ -1,0 +1,84 @@
+name: Supabase Project Status
+
+on:
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch and display all project statuses
+        env:
+          SUPABASE_TOKENS: ${{ secrets.SUPABASE_TOKENS }}
+        run: |
+          SUMMARY=""
+          SUMMARY+="# Supabase Project Status\n\n"
+          SUMMARY+="$(date -u '+%Y-%m-%d %H:%M UTC')\n\n"
+
+          ACCOUNT_NUM=0
+
+          echo "$SUPABASE_TOKENS" | jq -r '.[]' | while read -r TOKEN; do
+            ACCOUNT_NUM=$((ACCOUNT_NUM + 1))
+
+            # Fetch orgs
+            ORGS=$(curl -sf \
+              -H "Authorization: Bearer $TOKEN" \
+              https://api.supabase.com/v1/organizations)
+
+            # Fetch all projects
+            PROJECTS=$(curl -sf \
+              -H "Authorization: Bearer $TOKEN" \
+              https://api.supabase.com/v1/projects)
+
+            if [ -z "$PROJECTS" ] || [ "$PROJECTS" = "null" ]; then
+              echo "::warning::Could not fetch projects for account $ACCOUNT_NUM"
+              continue
+            fi
+
+            # Build org name lookup: id -> name
+            ORG_MAP=$(echo "$ORGS" | jq -r '.[] | "\(.id)=\(.name)"' 2>/dev/null || echo "")
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## Account $ACCOUNT_NUM" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Project | Org | Status | Region | Created |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|-----|--------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+
+            echo "$PROJECTS" | jq -c '.[]' | while read -r project; do
+              REF=$(echo "$project" | jq -r '.id')
+              NAME=$(echo "$project" | jq -r '.name')
+              STATUS=$(echo "$project" | jq -r '.status')
+              REGION=$(echo "$project" | jq -r '.region')
+              ORG_ID=$(echo "$project" | jq -r '.organization_id')
+              CREATED=$(echo "$project" | jq -r '.created_at' | cut -c1-10)
+
+              # Resolve org name
+              ORG_NAME=$(echo "$ORG_MAP" | grep "^${ORG_ID}=" | cut -d= -f2-)
+              [ -z "$ORG_NAME" ] && ORG_NAME="$ORG_ID"
+
+              # Status emoji
+              case "$STATUS" in
+                ACTIVE_HEALTHY) ICON="✅" ;;
+                INACTIVE)        ICON="💤" ;;
+                COMING_UP)       ICON="🔄" ;;
+                GOING_DOWN)      ICON="⬇️" ;;
+                PAUSING)         ICON="⏸️" ;;
+                RESTORING)       ICON="🔧" ;;
+                *)               ICON="❓" ;;
+              esac
+
+              echo "| **$NAME** \`$REF\` | $ORG_NAME | $ICON $STATUS | $REGION | $CREATED |" >> $GITHUB_STEP_SUMMARY
+            done
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            # Count active vs paused per account
+            TOTAL=$(echo "$PROJECTS" | jq 'length')
+            ACTIVE=$(echo "$PROJECTS" | jq '[.[] | select(.status == "ACTIVE_HEALTHY")] | length')
+            PAUSED=$(echo "$PROJECTS" | jq '[.[] | select(.status == "INACTIVE")] | length')
+            echo "_Total: $TOTAL | Active: $ACTIVE | Paused: $PAUSED_" >> $GITHUB_STEP_SUMMARY
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "> To rotate projects, use the **Supabase Rotate Projects** workflow." >> $GITHUB_STEP_SUMMARY

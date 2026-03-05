@@ -1,0 +1,231 @@
+name: Supabase Rotate Projects
+
+on:
+  workflow_dispatch:
+    inputs:
+      important_projects:
+        description: >
+          Comma-separated names of projects to keep running after rotation
+          (e.g. "Libriq, Ontra"). Leave empty to keep currently-active projects.
+        required: false
+        default: ""
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rotate all accounts
+        env:
+          SUPABASE_TOKENS: ${{ secrets.SUPABASE_TOKENS }}
+          IMPORTANT_INPUT: ${{ github.event.inputs.important_projects }}
+        run: |
+          # ─── Helpers ────────────────────────────────────────────────────────
+
+          wait_for_status() {
+            local TOKEN=$1
+            local REF=$2
+            local NAME=$3
+            local TARGET=$4          # ACTIVE_HEALTHY or INACTIVE
+            local MAX_WAIT=300        # 5 minutes
+            local ELAPSED=0
+
+            echo "  ⏳ Waiting for $NAME to reach $TARGET..."
+            while [ $ELAPSED -lt $MAX_WAIT ]; do
+              CURRENT=$(curl -sf \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://api.supabase.com/v1/projects/$REF" \
+                | jq -r '.status // "UNKNOWN"')
+
+              if [ "$CURRENT" = "$TARGET" ]; then
+                echo "  ✅ $NAME is now $TARGET"
+                return 0
+              fi
+              sleep 10
+              ELAPSED=$((ELAPSED + 10))
+              echo "  ... $NAME is $CURRENT (${ELAPSED}s elapsed)"
+            done
+
+            echo "  ::warning::$NAME did not reach $TARGET after ${MAX_WAIT}s (currently $CURRENT)"
+            return 1
+          }
+
+          pause_project() {
+            local TOKEN=$1 REF=$2 NAME=$3
+            echo "  ⏸️  Pausing $NAME..."
+            curl -sf -X POST \
+              -H "Authorization: Bearer $TOKEN" \
+              "https://api.supabase.com/v1/projects/$REF/pause" > /dev/null
+            wait_for_status "$TOKEN" "$REF" "$NAME" "INACTIVE"
+          }
+
+          restore_project() {
+            # Returns 0 on success, 1 if limit hit
+            local TOKEN=$1 REF=$2 NAME=$3
+            echo "  🔄 Restoring $NAME..."
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "Authorization: Bearer $TOKEN" \
+              "https://api.supabase.com/v1/projects/$REF/restore")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+              wait_for_status "$TOKEN" "$REF" "$NAME" "ACTIVE_HEALTHY"
+              return 0
+            else
+              BODY=$(echo "$RESPONSE" | head -1)
+              echo "  ⚠️  Could not restore $NAME (HTTP $HTTP_CODE): $BODY"
+              echo "  → Assuming project limit reached for this org/account"
+              return 1
+            fi
+          }
+
+          # ─── Parse important project names ──────────────────────────────────
+
+          # Normalize: trim spaces, lowercase for comparison
+          normalize() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+          IMPORTANT_NAMES_RAW="$IMPORTANT_INPUT"
+
+          # ─── Main loop over accounts ─────────────────────────────────────────
+
+          ACCOUNT_NUM=0
+
+          echo "$SUPABASE_TOKENS" | jq -r '.[]' | while read -r TOKEN; do
+            ACCOUNT_NUM=$((ACCOUNT_NUM + 1))
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "Account $ACCOUNT_NUM"
+            echo "════════════════════════════════════════"
+
+            PROJECTS=$(curl -sf \
+              -H "Authorization: Bearer $TOKEN" \
+              https://api.supabase.com/v1/projects)
+
+            if [ -z "$PROJECTS" ] || [ "$PROJECTS" = "null" ]; then
+              echo "::error::Could not fetch projects for account $ACCOUNT_NUM"
+              continue
+            fi
+
+            # Build arrays by reading project data
+            ALL_REFS=()
+            ALL_NAMES=()
+            ALL_STATUSES=()
+
+            while IFS= read -r line; do
+              ALL_REFS+=("$(echo "$line" | jq -r '.id')")
+              ALL_NAMES+=("$(echo "$line" | jq -r '.name')")
+              ALL_STATUSES+=("$(echo "$line" | jq -r '.status')")
+            done < <(echo "$PROJECTS" | jq -c '.[]')
+
+            TOTAL=${#ALL_REFS[@]}
+
+            # Determine important refs from names
+            IMPORTANT_REFS=()
+            if [ -n "$IMPORTANT_NAMES_RAW" ]; then
+              IFS=',' read -ra INPUT_NAMES <<< "$IMPORTANT_NAMES_RAW"
+              for INPUT_NAME in "${INPUT_NAMES[@]}"; do
+                NORM_INPUT=$(normalize "$INPUT_NAME")
+                for i in "${!ALL_NAMES[@]}"; do
+                  NORM_PROJECT=$(normalize "${ALL_NAMES[$i]}")
+                  if [ "$NORM_PROJECT" = "$NORM_INPUT" ]; then
+                    IMPORTANT_REFS+=("${ALL_REFS[$i]}")
+                    echo "📌 Important (matched): ${ALL_NAMES[$i]} (${ALL_REFS[$i]})"
+                  fi
+                done
+              done
+            else
+              # Default: currently active projects are important
+              for i in "${!ALL_REFS[@]}"; do
+                if [ "${ALL_STATUSES[$i]}" = "ACTIVE_HEALTHY" ]; then
+                  IMPORTANT_REFS+=("${ALL_REFS[$i]}")
+                  echo "📌 Important (currently active): ${ALL_NAMES[$i]} (${ALL_REFS[$i]})"
+                fi
+              done
+            fi
+
+            is_important() {
+              local REF=$1
+              for r in "${IMPORTANT_REFS[@]}"; do
+                [ "$r" = "$REF" ] && return 0
+              done
+              return 1
+            }
+
+            UNIMPORTANT_REFS=()
+            UNIMPORTANT_NAMES=()
+            for i in "${!ALL_REFS[@]}"; do
+              if ! is_important "${ALL_REFS[$i]}"; then
+                UNIMPORTANT_REFS+=("${ALL_REFS[$i]}")
+                UNIMPORTANT_NAMES+=("${ALL_NAMES[$i]}")
+              fi
+            done
+
+            echo ""
+            echo "📊 Total: $TOTAL | Important: ${#IMPORTANT_REFS[@]} | Unimportant: ${#UNIMPORTANT_REFS[@]}"
+            echo ""
+
+            # ── Step 1: Pause ALL currently-active projects ──────────────────
+            echo "── Step 1: Pause all active projects ──"
+            for i in "${!ALL_REFS[@]}"; do
+              if [ "${ALL_STATUSES[$i]}" = "ACTIVE_HEALTHY" ]; then
+                pause_project "$TOKEN" "${ALL_REFS[$i]}" "${ALL_NAMES[$i]}"
+              else
+                echo "  SKIP (already ${ALL_STATUSES[$i]}): ${ALL_NAMES[$i]}"
+              fi
+            done
+
+            # ── Step 2: Restore unimportant ones to reset their timers ───────
+            echo ""
+            echo "── Step 2: Restore unimportant projects (timer reset) ──"
+            RESTORED_UNIMPORTANT=()
+            for i in "${!UNIMPORTANT_REFS[@]}"; do
+              if restore_project "$TOKEN" "${UNIMPORTANT_REFS[$i]}" "${UNIMPORTANT_NAMES[$i]}"; then
+                RESTORED_UNIMPORTANT+=("${UNIMPORTANT_REFS[$i]}")
+              else
+                echo "  → Skipping remaining unimportant projects (limit reached)"
+                break
+              fi
+            done
+
+            # ── Step 3: Pause unimportant ones again ─────────────────────────
+            echo ""
+            echo "── Step 3: Pause unimportant projects again ──"
+            for i in "${!RESTORED_UNIMPORTANT[@]}"; do
+              REF="${RESTORED_UNIMPORTANT[$i]}"
+              # Find name
+              NAME=""
+              for j in "${!UNIMPORTANT_REFS[@]}"; do
+                [ "${UNIMPORTANT_REFS[$j]}" = "$REF" ] && NAME="${UNIMPORTANT_NAMES[$j]}" && break
+              done
+              pause_project "$TOKEN" "$REF" "$NAME"
+            done
+
+            # ── Step 4: Restore important projects ───────────────────────────
+            echo ""
+            echo "── Step 4: Restore important projects ──"
+            FAILED_IMPORTANT=()
+            for i in "${!IMPORTANT_REFS[@]}"; do
+              REF="${IMPORTANT_REFS[$i]}"
+              # Find name
+              NAME=""
+              for j in "${!ALL_REFS[@]}"; do
+                [ "${ALL_REFS[$j]}" = "$REF" ] && NAME="${ALL_NAMES[$j]}" && break
+              done
+              if ! restore_project "$TOKEN" "$REF" "$NAME"; then
+                FAILED_IMPORTANT+=("$NAME ($REF)")
+                echo "  ::warning::Could not restore important project $NAME — limit reached"
+              fi
+            done
+
+            # ── Summary ───────────────────────────────────────────────────────
+            echo ""
+            echo "── Account $ACCOUNT_NUM summary ──"
+            echo "  ✅ Timers reset for ${#RESTORED_UNIMPORTANT[@]}/${#UNIMPORTANT_REFS[@]} unimportant projects"
+            echo "  ✅ Important projects restored: $((${#IMPORTANT_REFS[@]} - ${#FAILED_IMPORTANT[@]}))/${#IMPORTANT_REFS[@]}"
+            if [ ${#FAILED_IMPORTANT[@]} -gt 0 ]; then
+              echo "  ⚠️  Could not restore (limit): ${FAILED_IMPORTANT[*]}"
+            fi
+
+          done
+
+          echo ""
+          echo "Rotation complete."
