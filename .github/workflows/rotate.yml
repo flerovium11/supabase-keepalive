@@ -59,7 +59,7 @@ jobs:
           }
 
           restore_project() {
-            # Returns 0 on success, 1 if limit hit
+            # Returns 0 on success, 1 if limit hit, 2 if project is unrecoverable
             local TOKEN=$1 REF=$2 NAME=$3
             echo "  🔄 Restoring $NAME..."
             RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
@@ -73,6 +73,13 @@ jobs:
             else
               BODY=$(echo "$RESPONSE" | head -1)
               echo "  ⚠️  Could not restore $NAME (HTTP $HTTP_CODE): $BODY"
+
+              # 400 = project-level error (unrecoverable for this project, not an account limit)
+              if [ "$HTTP_CODE" = "400" ]; then
+                echo "  → Project cannot be restored (skipping)"
+                return 2
+              fi
+
               echo "  → Assuming project limit reached for this org/account"
               return 1
             fi
@@ -178,8 +185,13 @@ jobs:
             echo "── Step 2: Restore unimportant projects (timer reset) ──"
             RESTORED_UNIMPORTANT=()
             for i in "${!UNIMPORTANT_REFS[@]}"; do
-              if restore_project "$TOKEN" "${UNIMPORTANT_REFS[$i]}" "${UNIMPORTANT_NAMES[$i]}"; then
+              RESULT=0
+              restore_project "$TOKEN" "${UNIMPORTANT_REFS[$i]}" "${UNIMPORTANT_NAMES[$i]}" || RESULT=$?
+              if [ "$RESULT" = "0" ]; then
                 RESTORED_UNIMPORTANT+=("${UNIMPORTANT_REFS[$i]}")
+              elif [ "$RESULT" = "2" ]; then
+                echo "  → Skipping unrecoverable project, continuing with others"
+                # continue loop — don't abort
               else
                 echo "  → Skipping remaining unimportant projects (limit reached)"
                 break
@@ -203,6 +215,7 @@ jobs:
             echo ""
             echo "── Step 4: Restore important projects ──"
             FAILED_IMPORTANT=()
+            DEAD_IMPORTANT=()
             for i in "${!IMPORTANT_REFS[@]}"; do
               REF="${IMPORTANT_REFS[$i]}"
               # Find name
@@ -210,9 +223,14 @@ jobs:
               for j in "${!ALL_REFS[@]}"; do
                 [ "${ALL_REFS[$j]}" = "$REF" ] && NAME="${ALL_NAMES[$j]}" && break
               done
-              if ! restore_project "$TOKEN" "$REF" "$NAME"; then
+              RESULT=0
+              restore_project "$TOKEN" "$REF" "$NAME" || RESULT=$?
+              if [ "$RESULT" = "1" ]; then
                 FAILED_IMPORTANT+=("$NAME ($REF)")
                 echo "  ::warning::Could not restore important project $NAME — limit reached"
+              elif [ "$RESULT" = "2" ]; then
+                DEAD_IMPORTANT+=("$NAME ($REF)")
+                echo "  ::error::Important project $NAME has been paused for 90+ days and cannot be restored"
               fi
             done
 
@@ -220,9 +238,12 @@ jobs:
             echo ""
             echo "── Account $ACCOUNT_NUM summary ──"
             echo "  ✅ Timers reset for ${#RESTORED_UNIMPORTANT[@]}/${#UNIMPORTANT_REFS[@]} unimportant projects"
-            echo "  ✅ Important projects restored: $((${#IMPORTANT_REFS[@]} - ${#FAILED_IMPORTANT[@]}))/${#IMPORTANT_REFS[@]}"
+            echo "  ✅ Important projects restored: $((${#IMPORTANT_REFS[@]} - ${#FAILED_IMPORTANT[@]} - ${#DEAD_IMPORTANT[@]}))/${#IMPORTANT_REFS[@]}"
             if [ ${#FAILED_IMPORTANT[@]} -gt 0 ]; then
               echo "  ⚠️  Could not restore (limit): ${FAILED_IMPORTANT[*]}"
+            fi
+            if [ ${#DEAD_IMPORTANT[@]} -gt 0 ]; then
+              echo "  💀 Could not restore (90+ days paused): ${DEAD_IMPORTANT[*]}"
             fi
 
           done
