@@ -22,30 +22,20 @@ jobs:
           # ─── Helpers ────────────────────────────────────────────────────────
 
           wait_for_status() {
-            local TOKEN=$1
-            local REF=$2
-            local NAME=$3
-            local TARGET=$4          # ACTIVE_HEALTHY or INACTIVE
-            local MAX_WAIT=300        # 5 minutes
-            local ELAPSED=0
-
+            local TOKEN=$1 REF=$2 NAME=$3 TARGET=$4
+            local MAX_WAIT=300 ELAPSED=0
             echo "  ⏳ Waiting for $NAME to reach $TARGET..."
             while [ $ELAPSED -lt $MAX_WAIT ]; do
               CURRENT=$(curl -sf \
                 -H "Authorization: Bearer $TOKEN" \
                 "https://api.supabase.com/v1/projects/$REF" \
                 | jq -r '.status // "UNKNOWN"')
-
-              if [ "$CURRENT" = "$TARGET" ]; then
-                echo "  ✅ $NAME is now $TARGET"
-                return 0
-              fi
+              [ "$CURRENT" = "$TARGET" ] && echo "  ✅ $NAME is $TARGET" && return 0
               sleep 10
               ELAPSED=$((ELAPSED + 10))
               echo "  ... $NAME is $CURRENT (${ELAPSED}s elapsed)"
             done
-
-            echo "  ::warning::$NAME did not reach $TARGET after ${MAX_WAIT}s (currently $CURRENT)"
+            echo "  ::warning::$NAME did not reach $TARGET after ${MAX_WAIT}s"
             return 1
           }
 
@@ -58,41 +48,32 @@ jobs:
             wait_for_status "$TOKEN" "$REF" "$NAME" "INACTIVE"
           }
 
+          # Returns 0 = success, 1 = quota limit hit, 2 = unrecoverable (90+ days)
           restore_project() {
-            # Returns 0 on success, 1 if limit hit, 2 if project is unrecoverable
             local TOKEN=$1 REF=$2 NAME=$3
             echo "  🔄 Restoring $NAME..."
             RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
               -H "Authorization: Bearer $TOKEN" \
               "https://api.supabase.com/v1/projects/$REF/restore")
             HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | head -1)
 
             if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
               wait_for_status "$TOKEN" "$REF" "$NAME" "ACTIVE_HEALTHY"
               return 0
+            elif [ "$HTTP_CODE" = "400" ]; then
+              echo "  ⚠️  $NAME cannot be restored (HTTP 400 — likely 90+ days paused): $BODY"
+              return 2
             else
-              BODY=$(echo "$RESPONSE" | head -1)
               echo "  ⚠️  Could not restore $NAME (HTTP $HTTP_CODE): $BODY"
-
-              # 400 = project-level error (unrecoverable for this project, not an account limit)
-              if [ "$HTTP_CODE" = "400" ]; then
-                echo "  → Project cannot be restored (skipping)"
-                return 2
-              fi
-
-              echo "  → Assuming project limit reached for this org/account"
+              echo "  → Assuming quota limit reached"
               return 1
             fi
           }
 
-          # ─── Parse important project names ──────────────────────────────────
-
-          # Normalize: trim spaces, lowercase for comparison
           normalize() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
-          IMPORTANT_NAMES_RAW="$IMPORTANT_INPUT"
-
-          # ─── Main loop over accounts ─────────────────────────────────────────
+          # ─── Main loop ──────────────────────────────────────────────────────
 
           ACCOUNT_NUM=0
 
@@ -112,35 +93,29 @@ jobs:
               continue
             fi
 
-            # Build arrays by reading project data
             ALL_REFS=()
             ALL_NAMES=()
             ALL_STATUSES=()
-
             while IFS= read -r line; do
               ALL_REFS+=("$(echo "$line" | jq -r '.id')")
               ALL_NAMES+=("$(echo "$line" | jq -r '.name')")
               ALL_STATUSES+=("$(echo "$line" | jq -r '.status')")
             done < <(echo "$PROJECTS" | jq -c '.[]')
 
-            TOTAL=${#ALL_REFS[@]}
-
-            # Determine important refs from names
+            # ── Determine important refs ────────────────────────────────────
             IMPORTANT_REFS=()
-            if [ -n "$IMPORTANT_NAMES_RAW" ]; then
-              IFS=',' read -ra INPUT_NAMES <<< "$IMPORTANT_NAMES_RAW"
+            if [ -n "$IMPORTANT_INPUT" ]; then
+              IFS=',' read -ra INPUT_NAMES <<< "$IMPORTANT_INPUT"
               for INPUT_NAME in "${INPUT_NAMES[@]}"; do
                 NORM_INPUT=$(normalize "$INPUT_NAME")
                 for i in "${!ALL_NAMES[@]}"; do
-                  NORM_PROJECT=$(normalize "${ALL_NAMES[$i]}")
-                  if [ "$NORM_PROJECT" = "$NORM_INPUT" ]; then
+                  if [ "$(normalize "${ALL_NAMES[$i]}")" = "$NORM_INPUT" ]; then
                     IMPORTANT_REFS+=("${ALL_REFS[$i]}")
                     echo "📌 Important (matched): ${ALL_NAMES[$i]} (${ALL_REFS[$i]})"
                   fi
                 done
               done
             else
-              # Default: currently active projects are important
               for i in "${!ALL_REFS[@]}"; do
                 if [ "${ALL_STATUSES[$i]}" = "ACTIVE_HEALTHY" ]; then
                   IMPORTANT_REFS+=("${ALL_REFS[$i]}")
@@ -150,10 +125,7 @@ jobs:
             fi
 
             is_important() {
-              local REF=$1
-              for r in "${IMPORTANT_REFS[@]}"; do
-                [ "$r" = "$REF" ] && return 0
-              done
+              for r in "${IMPORTANT_REFS[@]}"; do [ "$r" = "$1" ] && return 0; done
               return 1
             }
 
@@ -166,11 +138,11 @@ jobs:
               fi
             done
 
-            echo ""
+            TOTAL=${#ALL_REFS[@]}
             echo "📊 Total: $TOTAL | Important: ${#IMPORTANT_REFS[@]} | Unimportant: ${#UNIMPORTANT_REFS[@]}"
-            echo ""
 
-            # ── Step 1: Pause ALL currently-active projects ──────────────────
+            # ── Step 1: Pause everything currently active ───────────────────
+            echo ""
             echo "── Step 1: Pause all active projects ──"
             for i in "${!ALL_REFS[@]}"; do
               if [ "${ALL_STATUSES[$i]}" = "ACTIVE_HEALTHY" ]; then
@@ -180,45 +152,41 @@ jobs:
               fi
             done
 
-            # ── Step 2: Restore unimportant ones to reset their timers ───────
+            # ── Step 2: Reset timers for ALL unimportant projects ───────────
+            #
+            # Key insight: restore one → pause it → restore next.
+            # Only ever 1 project active at a time here, so quota is never touched.
+            #
             echo ""
-            echo "── Step 2: Restore unimportant projects (timer reset) ──"
-            RESTORED_UNIMPORTANT=()
+            echo "── Step 2: Reset inactivity timers (one at a time) ──"
+            RESET_COUNT=0
+            DEAD_UNIMPORTANT=()
             for i in "${!UNIMPORTANT_REFS[@]}"; do
+              REF="${UNIMPORTANT_REFS[$i]}"
+              NAME="${UNIMPORTANT_NAMES[$i]}"
               RESULT=0
-              restore_project "$TOKEN" "${UNIMPORTANT_REFS[$i]}" "${UNIMPORTANT_NAMES[$i]}" || RESULT=$?
+              restore_project "$TOKEN" "$REF" "$NAME" || RESULT=$?
               if [ "$RESULT" = "0" ]; then
-                RESTORED_UNIMPORTANT+=("${UNIMPORTANT_REFS[$i]}")
+                pause_project "$TOKEN" "$REF" "$NAME"
+                RESET_COUNT=$((RESET_COUNT + 1))
               elif [ "$RESULT" = "2" ]; then
-                echo "  → Skipping unrecoverable project, continuing with others"
-                # continue loop — don't abort
+                DEAD_UNIMPORTANT+=("$NAME")
+                echo "  → Unrecoverable, skipping"
               else
-                echo "  → Skipping remaining unimportant projects (limit reached)"
+                # Quota hit mid-reset. This shouldn't happen (we pause before
+                # each next restore), but handle it defensively.
+                echo "  ::warning::Unexpected quota error resetting $NAME — stopping timer resets"
                 break
               fi
             done
 
-            # ── Step 3: Pause unimportant ones again ─────────────────────────
+            # ── Step 3: Restore important projects ─────────────────────────
             echo ""
-            echo "── Step 3: Pause unimportant projects again ──"
-            for i in "${!RESTORED_UNIMPORTANT[@]}"; do
-              REF="${RESTORED_UNIMPORTANT[$i]}"
-              # Find name
-              NAME=""
-              for j in "${!UNIMPORTANT_REFS[@]}"; do
-                [ "${UNIMPORTANT_REFS[$j]}" = "$REF" ] && NAME="${UNIMPORTANT_NAMES[$j]}" && break
-              done
-              pause_project "$TOKEN" "$REF" "$NAME"
-            done
-
-            # ── Step 4: Restore important projects ───────────────────────────
-            echo ""
-            echo "── Step 4: Restore important projects ──"
+            echo "── Step 3: Restore important projects ──"
             FAILED_IMPORTANT=()
             DEAD_IMPORTANT=()
             for i in "${!IMPORTANT_REFS[@]}"; do
               REF="${IMPORTANT_REFS[$i]}"
-              # Find name
               NAME=""
               for j in "${!ALL_REFS[@]}"; do
                 [ "${ALL_REFS[$j]}" = "$REF" ] && NAME="${ALL_NAMES[$j]}" && break
@@ -226,17 +194,17 @@ jobs:
               RESULT=0
               restore_project "$TOKEN" "$REF" "$NAME" || RESULT=$?
               if [ "$RESULT" = "1" ]; then
-                FAILED_IMPORTANT+=("$NAME ($REF)")
-                echo "  ::warning::Could not restore important project $NAME — limit reached"
+                FAILED_IMPORTANT+=("$NAME")
+                echo "  ::warning::Quota full — could not restore important project: $NAME"
               elif [ "$RESULT" = "2" ]; then
-                DEAD_IMPORTANT+=("$NAME ($REF)")
-                echo "  ::error::Important project $NAME has been paused for 90+ days and cannot be restored"
+                DEAD_IMPORTANT+=("$NAME")
+                echo "  ::error::$NAME has been paused 90+ days and cannot be restored"
               fi
             done
 
-            # ── Step 5: Fill remaining quota with unimportant projects ──────
+            # ── Step 4: Fill remaining quota with unimportant projects ──────
             echo ""
-            echo "── Step 5: Restore unimportant projects to fill remaining quota ──"
+            echo "── Step 4: Fill remaining quota with unimportant projects ──"
             BONUS_RESTORED=()
             for i in "${!UNIMPORTANT_REFS[@]}"; do
               REF="${UNIMPORTANT_REFS[$i]}"
@@ -246,28 +214,23 @@ jobs:
               if [ "$RESULT" = "0" ]; then
                 BONUS_RESTORED+=("$NAME")
               elif [ "$RESULT" = "2" ]; then
-                echo "  → Unrecoverable, continuing"
+                echo "  → Unrecoverable, skipping"
               else
-                echo "  → Quota full, stopping"
+                echo "  → Quota full"
                 break
               fi
             done
 
-            # ── Summary ───────────────────────────────────────────────────────
+            # ── Summary ─────────────────────────────────────────────────────
             echo ""
             echo "── Account $ACCOUNT_NUM summary ──"
-            echo "  ✅ Timers reset for ${#RESTORED_UNIMPORTANT[@]}/${#UNIMPORTANT_REFS[@]} unimportant projects"
-            echo "  ✅ Important projects restored: $((${#IMPORTANT_REFS[@]} - ${#FAILED_IMPORTANT[@]} - ${#DEAD_IMPORTANT[@]}))/${#IMPORTANT_REFS[@]}"
-            echo "  ✅ Bonus unimportant projects left active: ${#BONUS_RESTORED[@]}"
-            if [ ${#BONUS_RESTORED[@]} -gt 0 ]; then
-              echo "     (${BONUS_RESTORED[*]})"
-            fi
-            if [ ${#FAILED_IMPORTANT[@]} -gt 0 ]; then
-              echo "  ⚠️  Could not restore (limit): ${FAILED_IMPORTANT[*]}"
-            fi
-            if [ ${#DEAD_IMPORTANT[@]} -gt 0 ]; then
-              echo "  💀 Could not restore (90+ days paused): ${DEAD_IMPORTANT[*]}"
-            fi
+            echo "  ✅ Timers reset: $RESET_COUNT/${#UNIMPORTANT_REFS[@]} unimportant projects"
+            echo "  ✅ Important restored: $((${#IMPORTANT_REFS[@]} - ${#FAILED_IMPORTANT[@]} - ${#DEAD_IMPORTANT[@]}))/${#IMPORTANT_REFS[@]}"
+            echo "  ✅ Bonus active (unimportant, fills quota): ${#BONUS_RESTORED[@]}"
+            [ ${#BONUS_RESTORED[@]}    -gt 0 ] && echo "     (${BONUS_RESTORED[*]})"
+            [ ${#FAILED_IMPORTANT[@]}  -gt 0 ] && echo "  ⚠️  Quota full for: ${FAILED_IMPORTANT[*]}"
+            [ ${#DEAD_IMPORTANT[@]}    -gt 0 ] && echo "  💀 90+ days paused (unrestorable): ${DEAD_IMPORTANT[*]}"
+            [ ${#DEAD_UNIMPORTANT[@]}  -gt 0 ] && echo "  💀 90+ days paused (skipped): ${DEAD_UNIMPORTANT[*]}"
 
           done
 
