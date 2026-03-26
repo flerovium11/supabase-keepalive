@@ -41,7 +41,6 @@ jobs:
                 continue
               fi
 
-              # Fetch the project's API keys using the management token
               KEYS=$(curl -sf \
                 -H "Authorization: Bearer $TOKEN" \
                 "https://api.supabase.com/v1/projects/${REF}/api-keys")
@@ -54,11 +53,12 @@ jobs:
                 continue
               fi
 
-              URL="https://${REF}.supabase.co/rest/v1/"
               HTTP=$(curl -o /dev/null -sw "%{http_code}" \
+                -X GET \
                 -H "apikey: $ANON_KEY" \
                 -H "Authorization: Bearer $ANON_KEY" \
-                "$URL")
+                -H "Accept: application/json" \
+                "https://${REF}.supabase.co/rest/v1/information_schema.tables?limit=1")
 
               if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 400 ]; then
                 echo "OK: $NAME → HTTP $HTTP"
