@@ -2,7 +2,7 @@ name: Supabase Keep-Alive
 
 on:
   schedule:
-    - cron: "0 8 */3 * *" # Every 3 days at 08:00 UTC
+    - cron: "0 8 */3 * *"
   workflow_dispatch:
 
 jobs:
@@ -41,12 +41,26 @@ jobs:
                 continue
               fi
 
+              # Fetch the project's API keys using the management token
+              KEYS=$(curl -sf \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://api.supabase.com/v1/projects/${REF}/api-keys")
+
+              ANON_KEY=$(echo "$KEYS" | jq -r '.[] | select(.name == "anon") | .api_key')
+
+              if [ -z "$ANON_KEY" ] || [ "$ANON_KEY" = "null" ]; then
+                echo "::warning::Could not fetch anon key for $NAME ($REF) — skipping"
+                echo "| ⚠️ | $NAME | \`$REF\` | no key |" >> $GITHUB_STEP_SUMMARY
+                continue
+              fi
+
               URL="https://${REF}.supabase.co/rest/v1/"
               HTTP=$(curl -o /dev/null -sw "%{http_code}" \
-                -H "apikey: $TOKEN" \
+                -H "apikey: $ANON_KEY" \
+                -H "Authorization: Bearer $ANON_KEY" \
                 "$URL")
 
-              if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 500 ]; then
+              if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 400 ]; then
                 echo "OK: $NAME → HTTP $HTTP"
                 echo "| ✅ | $NAME | \`$REF\` | $HTTP |" >> $GITHUB_STEP_SUMMARY
               else
