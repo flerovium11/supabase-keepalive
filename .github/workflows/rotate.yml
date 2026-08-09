@@ -24,25 +24,43 @@ jobs:
           wait_for_status() {
             local TOKEN=$1 REF=$2 NAME=$3 TARGET=$4
             local MAX_WAIT=300 ELAPSED=0
+
             echo "  ⏳ Waiting for $NAME to reach $TARGET..."
+
             while [ $ELAPSED -lt $MAX_WAIT ]; do
-              CURRENT=$(curl -sf \
+              RESPONSE=$(curl -sS -w "\n%{http_code}" \
                 -H "Authorization: Bearer $TOKEN" \
                 "https://api.supabase.com/v1/projects/$REF" \
-                | jq -r '.status // "UNKNOWN"')
-              [ "$CURRENT" = "$TARGET" ] && echo "  ✅ $NAME is $TARGET" && return 0
-              sleep 10
-              ELAPSED=$((ELAPSED + 10))
-              echo "  ... $NAME is $CURRENT (${ELAPSED}s elapsed)"
+                || true)
+
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+
+              if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
+                CURRENT=$(echo "$BODY" | jq -r '.status // "UNKNOWN"')
+
+                if [ "$CURRENT" = "$TARGET" ]; then
+                  echo "  ✅ $NAME is $TARGET"
+                  return 0
+                fi
+
+                echo "  ... $NAME is $CURRENT (${ELAPSED}s elapsed)"
+              else
+                echo "  ⚠️  Status check failed for $NAME (HTTP $HTTP_CODE): $BODY"
+              fi
+
+              sleep 30
+              ELAPSED=$((ELAPSED + 30))
             done
-            echo "  ::warning::$NAME did not reach $TARGET after ${MAX_WAIT}s"
+
+            echo "::warning::$NAME did not reach $TARGET after ${MAX_WAIT}s"
             return 1
           }
 
           pause_project() {
             local TOKEN=$1 REF=$2 NAME=$3
             echo "  ⏸️  Pausing $NAME..."
-            curl -sf -X POST \
+            curl -fsS -X POST \
               -H "Authorization: Bearer $TOKEN" \
               "https://api.supabase.com/v1/projects/$REF/pause" > /dev/null
             wait_for_status "$TOKEN" "$REF" "$NAME" "INACTIVE"
@@ -84,7 +102,7 @@ jobs:
             echo "Account $ACCOUNT_NUM"
             echo "════════════════════════════════════════"
 
-            PROJECTS=$(curl -sf \
+            PROJECTS=$(curl -fsS \
               -H "Authorization: Bearer $TOKEN" \
               https://api.supabase.com/v1/projects)
 
